@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<meta charset="UTF-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1.0">
+		<title>Kanban Sandbox</title>
+		<style>
+			body {
+				font-family: system-ui, sans-serif;
+				max-width: 700px;
+				margin: 40px auto;
+				padding: 0 16px;
+				background: #fff;
+				color: #222;
+			}
+			h1 {
+				border-bottom: 2px solid #333;
+				padding-bottom: 8px;
+			}
+			h2 {
+				margin-top: 32px;
+				border-bottom: 1px solid #ccc;
+				padding-bottom: 4px;
+			}
+			form {
+				display: flex;
+				flex-direction: column;
+				gap: 6px;
+				max-width: 400px;
+			}
+			input, button {
+				padding: 6px 8px;
+				font-size: 14px;
+			}
+			button {
+				width: fit-content;
+				cursor: pointer;
+			}
+			pre {
+				background: #f5f5f5;
+				padding: 8px;
+				border-radius: 4px;
+				overflow-x: auto;
+			}
+		</style>
+	</head>
+	<body>
+		<h1>Sanbox Kanban</h1>
+
+		<h2>Create a board</h2>
+		<form id="board-form">
+			<input type="text" id="board-title" placeholder="Board Title" required>
+			<button type="submit">Create</button>
+		</form>
+		<p id="board-status"></p>
+		<pre id="board-result"></pre>
+
+		<h2>Create a list</h2>
+		<form id="list-form">
+			<input type="text" id="board-id" placeholder="Board ID" required> <br/>
+			<input type="text" id="list-title" placeholder="List Title" required> <br/>
+			<input type="number" id="list-position" placeholder="List Position" required> <br/>
+			<button type="submit">Create</button>
+		</form>
+		<p id="list-status"></p>
+		<pre id="list-result"></pre>
+
+		<h2>Create a card</h2>
+		<form id="card-form">
+			<input type="text" id="list-id" placeholder="List ID" required> <br/>
+			<input type="text" id="card-title" placeholder="Card Title" required> <br/>
+			<input type="text" id="card-description" placeholder="Card description"> <br/>
+			<input type="number" id="card-position" placeholder="Card Position" required> <br/>
+			<button type="submit">Create</button>
+		</form>
+		<p id="card-status"></p>
+		<pre id="card-result"></pre>
+
+		<h2>View a board</h2>
+		<form id="view-board-form">
+		<input type="text" id="view-board-id" placeholder="Board ID" required>
+		<button type="submit">Load</button>
+		</form>
+		<div id="board-view"></div>
+
+		<h2>View a list</h2>
+		<form id="view-list-form">
+		<input type="text" id="view-list-id" placeholder="List ID" required>
+		<button type="submit">Load</button>
+		</form>
+		<div id="list-view"></div>
+
+		<h2>View a card</h2>
+		<form id="view-card-form">
+		<input type="text" id="view-card-id" placeholder="Card ID" required>
+		<button type="submit">Load</button>
+		</form>
+		<div id="card-view"></div>
+
+		<h2>Update a list</h2>
+		<form id="update-list-form">
+		<input type="text" id="update-list-id" placeholder="List ID" required>
+		<input type="text" id="update-list-title" placeholder="New title (leave empty to skip)">
+		<input type="number" id="update-list-position" placeholder="New position (leave empty to skip)">
+		<button type="submit">Update</button>
+		</form>
+		<p id="update-list-status"></p>
+		<pre id="update-list-result"></pre>
+
+		<h2>Update a card</h2>
+		<form id="update-card-form">
+		<input type="text" id="update-card-id" placeholder="Card ID" required>
+		<input type="text" id="update-card-title" placeholder="New title (leave empty to skip)">
+		<input type="text" id="update-card-description" placeholder="New description (leave empty to skip)">
+		<input type="text" id="update-card-list-id" placeholder="New list ID (leave empty to skip)">
+		<input type="text" id="update-card-linked-branch" placeholder="New linked branch (leave empty to skip)">
+		<input type="text" id="update-card-linked-pr-url" placeholder="New linked PR URL (leave empty to skip)">
+		<input type="text" id="update-card-status-field" placeholder="New status (leave empty to skip)">
+		<input type="number" id="update-card-position" placeholder="New position (leave empty to skip)">
+		<button type="submit">Update</button>
+		</form>
+		<p id="update-card-feedback"></p>
+		<pre id="update-card-result"></pre>
+
+		<h2>Delete a board</h2>
+		<form id="delete-board-form">
+		<input type="text" id="delete-board-id" placeholder="Board ID" required>
+		<button type="submit">Delete</button>
+		</form>
+		<p id="delete-board-feedback"></p>
+
+		<h2>Delete a list</h2>
+		<form id="delete-list-form">
+		<input type="text" id="delete-list-id" placeholder="List ID" required>
+		<button type="submit">Delete</button>
+		</form>
+		<p id="delete-list-feedback"></p>
+
+		<h2>Delete a card</h2>
+		<form id="delete-card-form">
+		<input type="text" id="delete-card-id" placeholder="Card ID" required>
+		<button type="submit">Delete</button>
+		</form>
+		<p id="delete-card-feedback"></p>
+
+		<script src="script.js"></script>
+	</body>
+
+</html>

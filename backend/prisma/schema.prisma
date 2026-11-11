@@ -1,0 +1,386 @@
+// Owner: Track 1 (Foundation, Auth, and API infrastructure)
+// Responsible for: the Prisma schema — source of truth for the database, replacing the former GORM struct definitions in backend/internal/db/models.go (Go skeleton, removed). Mirrors docs/db-schema.md.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// User maps to the `users` table: id, email, password_hash, password_salt, name, avatar.
+// oauth_provider and oauth_id were dropped in favor of OAuthAccount
+model User {
+  id            String   @id @default(uuid())
+  email         String   @unique
+  passwordHash  String   @map("password_hash")
+  passwordSalt  String   @map("password_salt")
+  name          String
+  avatar        String?
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  ownedProjects  Project[]       @relation("ProjectOwner")
+  memberships    ProjectMember[]
+  updatedNotes   Note[]          @relation("NoteUpdatedBy")
+  updatedWhiteboards Whiteboard[]    @relation("WhiteboardUpdatedBy")
+  uploads        Attachment[]    @relation("AttachmentUploadedBy")
+  createdCards   Card[]          @relation("CardCreatedBy")
+  notifications  Notification[]
+  createdInvites ProjectInvite[] @relation("InviteCreatedBy")
+  revokedInvites ProjectInvite[] @relation("InviteRevokedBy")
+  apiKeys        ApiKey[]
+  oauthAccounts  OAuthAccount[]
+
+  @@map("users")
+}
+
+// OAuthAccount maps to oauth_accounts, stores the user's GitHub access token so the backend
+// can call Github on the user's behalf
+model OAuthAccount {
+  id             String    @id @default(uuid())
+  userId         String    @map("user_id")
+  provider       String
+  providerId     String    @map("provider_id")
+  accessToken    String    @map("access_token")
+  refreshToken   String?   @map("refresh_token")
+  scopes         String?
+  expiresAt      DateTime? @map("expires_at")
+  createdAt      DateTime  @default(now()) @map("created_at")
+  updatedAt      DateTime  @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references:[id], onDelete: Cascade)
+
+  @@unique([provider, providerId])
+  @@index([userId])
+  @@map("oauth_accounts")
+}
+
+// Project maps to the `organizations`/`projects` table: id, name, owner_id — the Organization system major module.
+model Project {
+  id        String   @id @default(uuid())
+  name      String
+  ownerId   String   @map("owner_id")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  owner       User            @relation("ProjectOwner", fields: [ownerId], references: [id])
+  members     ProjectMember[]
+  invites     ProjectInvite[]
+  boards      Board[]
+  notes       Note[]
+  folders     Folder[]
+  whiteboard  Whiteboard?
+  whiteboardFiles WhiteboardFile[]
+  attachments Attachment[]
+  apiKeys     ApiKey[]
+  tags        Tag[]
+
+  @@map("projects")
+}
+
+// ProjectMember maps to `project_members` — the backbone of the Advanced permissions module.
+// This table is the single source of truth for authorization: every access-control check
+// (requireRole, getUserRole) reads from here, never from invite/token possession.
+model ProjectMember {
+  projectId String @map("project_id")
+  userId    String @map("user_id")
+  role      String
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([projectId, userId])
+  @@map("project_members")
+}
+
+// ProjectInvite maps to `project_invites` — invite links that, once joined, insert a row into
+// project_members (see modules/projects/invites.ts). The invite itself only ever proves "this
+// link was valid at join time"; it is never consulted for authorization afterwards. tokenHash
+// stores a hash of the invite token, never the plaintext token (mirrors ApiKey.keyHash below).
+model ProjectInvite {
+  id        String    @id @default(uuid())
+  projectId String    @map("project_id")
+  tokenHash String    @unique @map("token_hash")
+  role      String
+  maxUses   Int?      @map("max_uses")
+  useCount  Int       @default(0) @map("use_count")
+  expiresAt DateTime? @map("expires_at")
+  createdBy String?   @map("created_by")
+  createdAt DateTime  @default(now()) @map("created_at")
+  revokedBy String?   @map("revoked_by")
+  revokedAt DateTime? @map("revoked_at")
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  creator User?   @relation("InviteCreatedBy", fields: [createdBy], references: [id], onDelete: SetNull)
+  revoker User?   @relation("InviteRevokedBy", fields: [revokedBy], references: [id], onDelete: SetNull)
+
+  @@map("project_invites")
+}
+
+// Board maps to `boards`.
+model Board {
+  id        String   @id @default(uuid())
+  projectId String   @map("project_id")
+  title     String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  lists   List[]
+
+  @@map("boards")
+}
+
+// List maps to `lists` (Kanban columns).
+model List {
+  id       String @id @default(uuid())
+  boardId  String @map("board_id")
+  title    String
+  position Int
+
+  board Board  @relation(fields: [boardId], references: [id], onDelete: Cascade)
+  cards Card[]
+
+  @@map("lists")
+}
+
+// Card maps to `cards`: id, title, list_id, linked_branch, linked_pr_url, status.
+model Card {
+  id           String   @id @default(uuid())
+  listId       String   @map("list_id")
+  title        String
+  description  String?
+  linkedBranch String?  @map("linked_branch")
+  linkedPrUrl  String?  @map("linked_pr_url")
+  status       String   @default("todo")
+  position     Int
+  createdBy    String?  @map("created_by")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  list        List         @relation(fields: [listId], references: [id], onDelete: Cascade)
+  creator     User?        @relation("CardCreatedBy", fields: [createdBy], references: [id], onDelete: SetNull)
+  gitLink     GitLink?
+  noteLinks       CardNote[]
+  attachmentLinks CardAttachment[]
+  tags        CardTag[]
+
+  @@index([createdBy])
+  @@map("cards")
+}
+
+// Tag maps to `tags` — project-scoped labels (e.g. "bug", "urgent") applied to cards.
+// Scoped per-project (not global) so two projects can each have their own "bug" tag
+// with independent colors, and deleting a project cleans up its tags automatically.
+model Tag {
+  id        String   @id @default(uuid())
+  projectId String   @map("project_id")
+  name      String
+  color     String   @default("#6b7280")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  project Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  cards   CardTag[]
+
+  @@unique([projectId, name])
+  @@map("tags")
+}
+
+// CardTag maps to `card_tags` — the many-to-many join between cards and tags. Explicit
+// join table (rather than an implicit Prisma m-n) to match the project's existing
+// convention (see ProjectMember) and leave room for future columns (e.g. added_by/added_at)
+// without a schema rewrite.
+model CardTag {
+  cardId String @map("card_id")
+  tagId  String @map("tag_id")
+
+  card Card @relation(fields: [cardId], references: [id], onDelete: Cascade)
+  tag  Tag  @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([cardId, tagId])
+  @@index([tagId])
+  @@map("card_tags")
+}
+
+// Folder maps to folders depth and subfolder limits live in the folders service
+model Folder {
+  id        String   @id @default(uuid())
+  projectId String   @map("project_id")
+  parentId  String?  @map("parent_id")
+  name      String
+  createdBy String?  @map("created_by")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  project     Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  parent      Folder?      @relation("FolderTree", fields: [parentId], references: [id], onDelete: Restrict)
+  children    Folder[]     @relation("FolderTree")
+  attachments Attachment[]
+
+  @@index([projectId, parentId])
+  @@map("folders")
+}
+
+// Note maps to notes yjs_state is the source of truth and content_json a derived copy for search
+model Note {
+  id          String   @id @default(uuid())
+  projectId   String   @map("project_id")
+  title       String   @default("Sans titre")
+  contentJson Json     @map("content_json")
+  yjsState    Bytes?   @map("yjs_state")
+  updatedBy   String?  @map("updated_by")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  project   Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  editor    User?      @relation("NoteUpdatedBy", fields: [updatedBy], references: [id], onDelete: SetNull)
+  cardLinks CardNote[]
+
+  @@index([projectId])
+  @@map("notes")
+}
+
+// Whiteboard maps to `whiteboards` — one Excalidraw scene per project, autosaved from the
+// frontend. The scene (elements + view state) is stored as JSON so it stays re-editable.
+model Whiteboard {
+  id        String   @id @default(uuid())
+  projectId String   @unique @map("project_id")
+  sceneJson Json     @map("scene_json")
+  updatedBy String?   @map("updated_by")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  editor  User?   @relation("WhiteboardUpdatedBy", fields: [updatedBy], references: [id], onDelete: SetNull)
+
+  @@map("whiteboards")
+}
+
+// WhiteboardFile maps to `whiteboard_files` — the binary side of a whiteboard: Excalidraw keeps images
+// out of the scene's elements (an image element only carries a fileId), so they are stored here as data URLs.
+// file_id is Excalidraw's content hash, so the same image uploaded twice is one row.
+model WhiteboardFile {
+  id        String   @id @default(uuid())
+  projectId String   @map("project_id")
+  fileId    String   @map("file_id")
+  mimeType  String   @map("mime_type")
+  dataUrl   String   @map("data_url")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, fileId])
+  @@map("whiteboard_files")
+}
+
+// Attachment maps to `attachments` — covers regular file uploads and exported whiteboard images alike.
+model Attachment {
+  id         String   @id @default(uuid())
+  projectId  String   @map("project_id")
+  folderId   String?  @map("folder_id")
+  fileUrl    String   @map("file_url")
+  fileName   String   @map("file_name")
+  fileSize   Int      @map("file_size")
+  fileType   String   @map("file_type")
+  uploadedBy String?  @map("uploaded_by")
+  uploadedAt DateTime @default(now()) @map("uploaded_at")
+
+  project   Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  folder    Folder?          @relation(fields: [folderId], references: [id], onDelete: Restrict)
+  uploader  User?            @relation("AttachmentUploadedBy", fields: [uploadedBy], references: [id], onDelete: SetNull)
+  cardLinks CardAttachment[]
+
+  @@index([projectId, folderId])
+  @@map("attachments")
+}
+
+// CardNote maps to card_notes
+model CardNote {
+  cardId String @map("card_id")
+  noteId String @map("note_id")
+
+  card Card @relation(fields: [cardId], references: [id], onDelete: Cascade)
+  note Note @relation(fields: [noteId], references: [id], onDelete: Cascade)
+
+  @@id([cardId, noteId])
+  @@index([noteId])
+  @@map("card_notes")
+}
+
+// CardAttachment maps to card_attachments
+model CardAttachment {
+  cardId       String @map("card_id")
+  attachmentId String @map("attachment_id")
+
+  card       Card       @relation(fields: [cardId], references: [id], onDelete: Cascade)
+  attachment Attachment @relation(fields: [attachmentId], references: [id], onDelete: Cascade)
+
+  @@id([cardId, attachmentId])
+  @@index([attachmentId])
+  @@map("card_attachments")
+}
+
+// GitLink maps to `git_links`: card_id, repo_url, branch_name, pr_status — drives Track 3's card status automation.
+model GitLink {
+  cardId     String @id @map("card_id")
+  repoUrl    String @map("repo_url")
+  branchName String @map("branch_name")
+  prStatus   String @map("pr_status")
+
+  card Card @relation(fields: [cardId], references: [id], onDelete: Cascade)
+
+  @@map("git_links")
+}
+
+// Notification maps to `notifications` — fires on creation/update/deletion actions per Track 4's notification module.
+model Notification {
+  id        String    @id @default(uuid())
+  userId    String    @map("user_id")
+  type      String
+  payload   Json
+  readAt    DateTime? @map("read_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@map("notifications")
+}
+
+// WebhookEvent maps to `webhook_events` — audit log of every Git webhook received, owned by Track 3.
+model WebhookEvent {
+  id          String    @id @default(uuid())
+  provider    String
+  repo        String
+  eventType   String    @map("event_type")
+  payload     Json
+  processedAt DateTime? @map("processed_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  @@map("webhook_events")
+}
+
+// ApiKey maps to `api_keys` — supports the Public API major module.
+model ApiKey {
+  id        String   @id @default(uuid())
+  projectId String?  @map("project_id")
+  userId    String?  @map("user_id")
+  keyHash   String   @map("key_hash")
+  rateLimit Int      @map("rate_limit")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  project Project? @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user    User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@map("api_keys")
+}
+
+// AppSetting maps to `app_settings` — small runtime switches an admin can flip without redeploying
+// (today: "signup_open", see modules/auth/signupGate.ts).
+model AppSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("app_settings")
+}

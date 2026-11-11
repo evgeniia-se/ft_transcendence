@@ -1,0 +1,410 @@
+#!/bin/bash
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+FIRST_RUN=""
+CERTS_DIR="$SCRIPT_DIR/infra/nginx/certs"
+
+# read a KEY=value from .env, falling back to .env.example, then a hard default
+env_value() {
+  local key="$1" default="$2" file val=""
+  for file in "$SCRIPT_DIR/.env" "$SCRIPT_DIR/.env.example"; do
+    [ -f "$file" ] || continue
+    val="$(sed -n "s/^${key}=//p" "$file" | head -n1)"
+    [ -n "$val" ] && break
+  done
+  printf '%s\n' "${val:-$default}"
+}
+
+show_urls() {
+  local http https
+  http="$(env_value HTTP_PORT 8080)"
+  https="$(env_value HTTPS_PORT 8443)"
+  echo ""
+  echo "==> Up. Open:"
+  echo "      https://localhost:${https}/            — app (accept the browser warning if the cert is self-signed)"
+  echo "      https://localhost:${https}/api/health  — backend smoke test (should say \"status\":\"ok\")"
+  echo "      http://localhost:${http}/              — redirects to https"
+  echo "      https://localhost:${https}/api/admin/signup — open/close account creation (SIGNUP_ADMIN_PASSWORD in .env)"
+}
+
+STAMP_FILE="$SCRIPT_DIR/.build-hash"
+NO_CACHE=""
+
+# hash of the files an image is built from (files ignored by git are skipped)
+sources_hash() {
+  (cd "$SCRIPT_DIR" && git ls-files -co --exclude-standard -z -- "$1" | sort -z \
+    | xargs -0 sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1)
+}
+
+stamp_get() {
+  sed -n "s/^$1=//p" "$STAMP_FILE" 2>/dev/null | head -n1
+}
+
+stamp_set() {
+  local tmp
+  tmp="$(mktemp)"
+  { grep -v "^$1=" "$STAMP_FILE" 2>/dev/null || true; echo "$1=$2"; } > "$tmp"
+  cat "$tmp" > "$STAMP_FILE"
+  rm -f "$tmp"
+}
+
+# build_services builds the services whose sources changed (or whose image is gone).
+# BUILT is set to 1 if something was built
+build_services() {
+  local svc hash
+  BUILT=""
+  for svc in "$@"; do
+    hash="$(sources_hash "$svc")"
+    if [ -z "$NO_CACHE" ] && [ "$(stamp_get "$svc")" = "$hash" ] \
+      && docker image inspect "ft_transcendence_$svc" >/dev/null 2>&1; then
+      echo "==> $svc: sources unchanged, keeping its image"
+      continue
+    fi
+    echo "==> Building $svc..."
+    docker compose build $NO_CACHE "$svc"
+    stamp_set "$svc" "$hash"
+    BUILT=1
+  done
+}
+
+ensure_env() {
+  if [ ! -f "$SCRIPT_DIR/.env" ]; then
+    echo "==> No .env found — creating one from .env.example"
+    cp "$SCRIPT_DIR/.env.example" "$SCRIPT_DIR/.env"
+    FIRST_RUN=1
+    # a brand new .env means no database exists yet, so its password can be random from the start
+    db_password="$(openssl rand -hex 16)"
+    dotenv_set POSTGRES_PASSWORD "$db_password"
+    dotenv_set DATABASE_URL "postgresql://$(dotenv_get POSTGRES_USER):$db_password@localhost:5432/$(dotenv_get POSTGRES_DB)"
+    echo "    Edit .env to set real secrets before any non-local use."
+  fi
+}
+
+# JWT_SECRET and GIT_WEBHOOK_SECRET must never stay at the "change_me" placeholder of .env.example: anybody could
+# then forge a session token or a webhook. They are generated here; this only replaces the placeholder (or an empty
+# value), so a secret you set yourself is left alone.
+ensure_secrets() {
+  local key value db_password
+  value="$(dotenv_get POSTGRES_PASSWORD)"
+  if [ -z "$value" ] || [ "$value" = "change_me" ]; then
+    if docker volume ls -q | grep -q '_db_data$'; then
+      echo "==> POSTGRES_PASSWORD is the placeholder, but a database already exists with it."
+      echo "    Run '$0 clear' to recreate the database with a random password."
+    else
+      echo "==> Generating POSTGRES_PASSWORD (it was the placeholder)"
+      db_password="$(openssl rand -hex 16)"
+      dotenv_set POSTGRES_PASSWORD "$db_password"
+      dotenv_set DATABASE_URL "postgresql://$(dotenv_get POSTGRES_USER):$db_password@localhost:5432/$(dotenv_get POSTGRES_DB)"
+    fi
+  fi
+  for key in JWT_SECRET GIT_WEBHOOK_SECRET; do
+    value="$(dotenv_get "$key")"
+    if [ -z "$value" ] || [ "$value" = "change_me" ]; then
+      echo "==> Generating $key (it was the placeholder)"
+      dotenv_set "$key" "$(openssl rand -hex 32)"
+    fi
+  done
+}
+
+# read KEY from .env only (no fallback)
+dotenv_get() {
+  sed -n "s/^$1=//p" "$SCRIPT_DIR/.env" | head -n1
+}
+
+# set KEY=value in .env; awk keeps special characters as they are
+dotenv_set() {
+  local tmp
+  tmp="$(mktemp)"
+  KEY="$1" VAL="$2" awk '
+    BEGIN { k = ENVIRON["KEY"]; v = ENVIRON["VAL"]; done = 0 }
+    index($0, k "=") == 1 { print k "=" v; done = 1; next }
+    { print }
+    END { if (!done) print k "=" v }
+  ' "$SCRIPT_DIR/.env" > "$tmp" && cat "$tmp" > "$SCRIPT_DIR/.env"
+  rm -f "$tmp"
+}
+
+# ask "label" default: prompt for a value, Enter keeps the default
+ask() {
+  local answer=""
+  read -r -p "    $1 [$2]: " answer || true
+  printf '%s\n' "${answer:-$2}"
+}
+
+# First-run questions, so nothing has to be edited by hand in .env: ports, public address, signup admin password.
+# Without a terminal (CI) every default is kept. Also available later as './transcendence setup'.
+ask_setup() {
+  local http https bind origin mode pass="" cert="" key=""
+  [ -t 0 ] || return 0
+  echo "==> Configuration (Enter keeps the value in brackets)"
+  echo "    dev  = relaxed checks, verbose warnings (local work)."
+  echo "    prod = placeholder secrets refused, CORS locked to the public address."
+  mode="$(ask "Mode (dev/prod)" "$([ "$(dotenv_get NODE_ENV)" = production ] && echo prod || echo dev)")"
+  case "$mode" in
+    prod|production) mode=production ;;
+    *) mode=development ;;
+  esac
+  dotenv_set NODE_ENV "$mode"
+  http="$(ask "HTTP port " "$(env_value HTTP_PORT 8080)")"
+  https="$(ask "HTTPS port" "$(env_value HTTPS_PORT 8443)")"
+  dotenv_set HTTP_PORT "$http"
+  dotenv_set HTTPS_PORT "$https"
+  echo "    Listen address: 127.0.0.1 = this machine only, 0.0.0.0 = reachable from the Internet (needed for a public server)."
+  bind="$(ask "Listen address" "$([ "$mode" = production ] && echo 0.0.0.0 || echo "$(env_value BIND_ADDRESS 127.0.0.1)")")"
+  dotenv_set BIND_ADDRESS "$bind"
+  echo "    Public https address of the app (e.g. https://transcendence.example.com), used for GitHub webhooks."
+  echo "    Leave empty for a local install (GitHub cannot reach localhost)."
+  origin="$(ask "Public address" "$(dotenv_get WEBHOOK_PUBLIC_URL)")"
+  origin="${origin%/}"
+  case "$origin" in
+    "") ;;
+    https://*) ;;
+    http://*) echo "    The address must use https: using https:// instead."; origin="https://${origin#http://}" ;;
+    *) origin="https://$origin" ;;
+  esac
+  dotenv_set WEBHOOK_PUBLIC_URL "$origin"
+  dotenv_set GITHUB_OAUTH_REDIRECT_URI "${origin:-https://localhost:$https}/api/auth/oauth/github/callback"
+  # the backend refuses to start in production without it; in dev it stays open (the Vite dev server)
+  if [ "$mode" = production ]; then
+    dotenv_set CORS_ORIGIN "${origin:-https://localhost:$https}"
+  else
+    dotenv_set CORS_ORIGIN ""
+  fi
+  echo "    TLS certificate: Enter = self-signed (browsers warn). Or give the paths of your own (e.g. Let's Encrypt:"
+  echo "    /etc/letsencrypt/live/<domain>/fullchain.pem and privkey.pem); they are copied again on every start/restart."
+  read -r -p "    Certificate file [self-signed]: " cert || true
+  if [ -n "$cert" ]; then
+    read -r -p "    Private key file: " key || true
+    if [ -r "$cert" ] && [ -r "$key" ]; then
+      dotenv_set CERT_FILE "$cert"
+      dotenv_set KEY_FILE "$key"
+    else
+      echo "    Cannot read one of the two files: keeping the self-signed certificate."
+      cert=""
+    fi
+  fi
+  if [ -z "$cert" ]; then
+    dotenv_set CERT_FILE ""
+    dotenv_set KEY_FILE ""
+  fi
+  echo "    Password of the admin page ${origin:-https://localhost:$https}/api/admin/signup (opens/closes account creation)."
+  read -r -s -p "    SIGNUP_ADMIN_PASSWORD (12+ characters, Enter = generate one): " pass || true
+  echo ""
+  if [ -n "$pass" ] && [ "${#pass}" -lt 12 ]; then
+    echo "    Too short, generating one instead."
+    pass=""
+  fi
+  if [ -n "$pass" ]; then
+    dotenv_set SIGNUP_ADMIN_PASSWORD "$pass"
+  fi
+}
+
+# a password left at the placeholder of .env.example (blank answer, no terminal, old .env) gets a random value
+ensure_admin_password() {
+  local value
+  value="$(dotenv_get SIGNUP_ADMIN_PASSWORD)"
+  if [ -z "$value" ] || [ "$value" = "change_me" ] || [ "${#value}" -lt 12 ]; then
+    value="$(openssl rand -hex 12)"
+    dotenv_set SIGNUP_ADMIN_PASSWORD "$value"
+    echo "==> Generated SIGNUP_ADMIN_PASSWORD: $value   (kept in .env)"
+  fi
+}
+
+# GitHub OAuth app credentials. Blank answer or no terminal: random placeholders
+# (GitHub login won't work until you run ./transcendence oauth).
+ask_oauth() {
+  local id="" secret=""
+  if [ -t 0 ]; then
+    echo "==> GitHub OAuth (login with GitHub)"
+    echo "    Create an OAuth App on https://github.com/settings/developers, with callback URL:"
+    echo "      $(env_value GITHUB_OAUTH_REDIRECT_URI https://localhost:8443/api/auth/oauth/github/callback)"
+    echo "    Leave blank to use a random placeholder (GitHub login won't work, email/password will)."
+    read -r -p "    GITHUB_CLIENT_ID: " id || true
+    read -r -s -p "    GITHUB_CLIENT_SECRET: " secret || true
+    echo ""
+  fi
+  if [ -z "$id" ] || [ -z "$secret" ]; then
+    id="placeholder_$(openssl rand -hex 8)"
+    secret="placeholder_$(openssl rand -hex 20)"
+    echo "    Using random placeholders for GitHub OAuth (GitHub login disabled)."
+  fi
+  dotenv_set GITHUB_CLIENT_ID "$id"
+  dotenv_set GITHUB_CLIENT_SECRET "$secret"
+}
+
+ensure_oauth() {
+  [ -n "$FIRST_RUN" ] && ask_setup
+  ensure_admin_password
+  # the backend refuses to start in production without CORS_ORIGIN (an older .env may lack it)
+  if [ "$(dotenv_get NODE_ENV)" = production ] && [ -z "$(dotenv_get CORS_ORIGIN)" ]; then
+    dotenv_set CORS_ORIGIN "$(dotenv_get WEBHOOK_PUBLIC_URL)"
+    [ -n "$(dotenv_get CORS_ORIGIN)" ] || dotenv_set CORS_ORIGIN "https://localhost:$(env_value HTTPS_PORT 8443)"
+  fi
+  # first run or missing credentials
+  if [ -z "$(dotenv_get GITHUB_CLIENT_ID)" ] || [ -z "$(dotenv_get GITHUB_CLIENT_SECRET)" ]; then
+    ask_oauth
+  fi
+
+  # the encryption key must be 64 hex chars: generate it, never ask
+  if ! printf '%s' "$(dotenv_get OAUTH_TOKEN_ENCRYPTION_KEY)" | grep -Eq '^[0-9a-fA-F]{64}$'; then
+    echo "==> Generating OAUTH_TOKEN_ENCRYPTION_KEY"
+    dotenv_set OAUTH_TOKEN_ENCRYPTION_KEY "$(openssl rand -hex 32)"
+  fi
+}
+
+generate_certs() {
+  local cert key
+  cert="$(dotenv_get CERT_FILE)"
+  key="$(dotenv_get KEY_FILE)"
+  if [ -n "$cert" ] && [ -n "$key" ]; then
+    if [ ! -r "$cert" ] || [ ! -r "$key" ]; then
+      echo "==> CERT_FILE / KEY_FILE in .env are not readable ($cert, $key). Fix them with '$0 setup'."
+      exit 1
+    fi
+    mkdir -p "$CERTS_DIR"
+    cp "$cert" "$CERTS_DIR/server.crt"
+    cp "$key" "$CERTS_DIR/server.key"
+    chmod 600 "$CERTS_DIR/server.key"
+    echo "==> Using your TLS certificate ($cert)"
+    return 0
+  fi
+  if [ ! -f "$CERTS_DIR/server.crt" ] || [ ! -f "$CERTS_DIR/server.key" ]; then
+    echo "==> Generating self-signed SSL certificates..."
+    mkdir -p "$CERTS_DIR"
+    openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+      -keyout "$CERTS_DIR/server.key" \
+      -out "$CERTS_DIR/server.crt" \
+      -subj "/C=FR/ST=Paris/O=42/CN=localhost" 2>/dev/null
+    echo "    Certificates generated in $CERTS_DIR"
+  fi
+}
+
+# builds what changed, then starts everything. Nothing is rebuilt when the sources did not change
+start_stack() {
+  build_services backend frontend
+  if [ -n "$BUILT" ]; then
+    docker compose up -d --force-recreate
+  else
+    docker compose up -d
+  fi
+}
+
+# the db healthcheck only runs pg_isready, which succeeds even when the volume holds an old database created with
+# another password. Log in through the network address of the service with the credentials of .env: the
+# socket and 127.0.0.1 are trusted by the image and never check the password
+check_db() {
+  local user pass name i out=""
+  user="$(env_value POSTGRES_USER postgres)"
+  pass="$(env_value POSTGRES_PASSWORD "")"
+  name="$(env_value POSTGRES_DB postgres)"
+  echo "==> Checking the database..."
+  for i in $(seq 1 10); do
+    if out="$(PGPASSWORD="$pass" docker compose exec -T -e PGCONNECT_TIMEOUT=3 -e PGPASSWORD db \
+      psql -h db -U "$user" -d "$name" -tAc 'select 1' 2>&1)"; then
+      echo "    Database OK"
+      return 0
+    fi
+    case "$out" in *"authentication failed"*|*"does not exist"*) break ;; esac
+    sleep 2
+  done
+  echo "    Database check FAILED:"
+  echo "$out" | sed 's/^/      /'
+  echo "    The database volume is probably an old one (other password or name than .env)."
+  echo "    Run '$0 clear' then '$0 start' to recreate it from scratch (all data is lost)."
+  return 1
+}
+
+usage() {
+  echo "Usage: $0 {start|stop|restart|reload|clean|clear|oauth|setup} [--no-cache]"
+  echo ""
+  echo "  start           — start all containers, building only what changed since the last build"
+  echo "  stop            — stop and remove all containers (images are kept)"
+  echo "  restart         — stop, then start"
+  echo "  reload          — rebuild the frontend only and refresh what nginx serves"
+  echo "  clean           — delete build leftovers (node_modules, dist, unused image layers)."
+  echo "                    Safe while running; images in use and the database are kept"
+  echo "  clear           — stop everything and delete ALL state: database, uploads, served frontend, build stamps."
+  echo "                    .env and certificates are kept. The next start recreates a fresh database"
+  echo "  oauth           — (re)enter the GitHub OAuth credentials stored in .env"
+  echo "  setup           — re-ask ports, public address and signup admin password (stored in .env)"
+  echo ""
+  echo "  --no-cache      — rebuild the images from scratch (re-runs npm ci; slow)"
+  exit 1
+}
+
+# second arg may be --no-cache
+if [ "$2" = "--no-cache" ]; then
+  NO_CACHE="--no-cache"
+elif [ -n "$2" ]; then
+  usage
+fi
+
+case "$1" in
+  start)
+    ensure_env
+    ensure_secrets
+    ensure_oauth
+    generate_certs
+    start_stack
+    check_db
+    show_urls
+    ;;
+
+  stop)
+    docker compose down
+    ;;
+
+  restart)
+    ensure_env
+    ensure_secrets
+    ensure_oauth
+    generate_certs
+    docker compose down
+    start_stack
+    check_db
+    show_urls
+    ;;
+
+  reload)
+    ensure_env
+    # the frontend container copies the build into the volume nginx serves
+    build_services frontend
+    echo "==> Refreshing the static volume..."
+    docker compose up -d --force-recreate frontend
+    echo "==> Reloading nginx..."
+    docker compose exec nginx nginx -s reload
+    ;;
+
+  clean)
+    echo "==> Removing local build folders..."
+    rm -rf "$SCRIPT_DIR"/{backend,frontend}/{node_modules,dist}
+    echo "==> Removing unused image layers (images used by containers are kept)..."
+    docker image prune -f
+    ;;
+
+  clear)
+    echo "==> Removing containers and volumes (database, uploads, frontend)..."
+    docker compose down -v --remove-orphans
+    rm -f "$STAMP_FILE"
+    echo "==> State cleared. '$0 start' will create a fresh database."
+    ;;
+
+  oauth)
+    ensure_env
+    ask_oauth
+    echo "==> Saved in .env. Run '$0 restart' for the backend to pick it up."
+    ;;
+
+  setup)
+    ensure_env
+    ask_setup
+    ensure_admin_password
+    echo "==> Saved in .env. Run '$0 restart' to apply."
+    ;;
+
+  *)
+    usage
+    ;;
+esac

@@ -1,0 +1,13 @@
+# Owner: Track 1
+# Keep the build context small and stop the host's node_modules / build output from
+# landing on top of the container's `npm ci` (COPY . . in the Dockerfile).
+node_modules
+dist
+build
+.vite
+.env
+.env.*
+*.log
+.git
+Dockerfile
+.dockerignore

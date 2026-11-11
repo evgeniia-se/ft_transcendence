@@ -1,0 +1,7 @@
+{
+  "_comment": "Owner: Track 1 (Foundation, Auth, and API infrastructure) — placeholder formatting config.",
+  "semi": true,
+  "singleQuote": false,
+  "trailingComma": "es5",
+  "printWidth": 100
+}

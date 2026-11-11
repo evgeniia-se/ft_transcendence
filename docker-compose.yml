@@ -1,0 +1,118 @@
+# Owner: Track 1 (Foundation, Auth, and API infrastructure)
+# Responsible for: containerized deployment of frontend, backend, Postgres, and the Nginx reverse proxy.
+#
+# Stack note: backend service now runs Node.js + TypeScript (Fastify + Socket.IO + Prisma), replacing the
+# earlier Go binary. Compiled output is a Node process (`node dist/server.js`), not a static Go binary.
+#
+# Base image note: all images are Debian-based (not Alpine), matching the base used in Inception.
+# Node.js + Prisma depend on native binary engines built against glibc; Alpine's musl libc requires
+# separate binaryTargets and carries a history of native-addon/DNS edge cases, so Debian avoids that
+# whole class of problem and keeps every service on one consistent libc across the stack.
+
+services:
+  db:
+    image: docker.io/library/postgres:16
+    restart: unless-stopped
+    networks:
+      - app_net
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    # No published port on purpose: only the backend talks to the database, over app_net. Publishing 5432 would
+    # clash with a Postgres already running on the host and expose the database to the network.
+    # To open a shell on it: docker compose exec db psql -U "$POSTGRES_USER" "$POSTGRES_DB"
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    image: ft_transcendence_backend
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    networks:
+      - app_net
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+    volumes:
+      - uploads_data:/app/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+    # `exec` so node replaces the shell as PID 1 and actually receives SIGTERM —
+    # without it the shell swallows the signal and the graceful shutdown in
+    # server.ts never runs (container gets SIGKILLed after the 10s timeout).
+    command: sh -c "npx prisma migrate deploy && exec node dist/server.js"
+    security_opt:
+      - no-new-privileges:true
+    expose:
+      - "3000"
+
+  frontend:
+    image: ft_transcendence_frontend
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    # Build-and-copy sidecar: refreshes the shared frontend_dist volume with the
+    # freshly built static files on every `docker compose up`, then exits 0.
+    # A named volume is only auto-populated from image content the first time it
+    # is created, so without this copy an image rebuild would never reach nginx.
+    restart: "no"
+    networks:
+      - app_net
+    volumes:
+      - frontend_dist:/export
+    command: sh -c "rm -rf /export/* && cp -r /usr/share/nginx/html/. /export/"
+
+  nginx:
+    image: docker.io/library/nginx:1.27
+    restart: unless-stopped
+    stop_signal: SIGTERM
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      # all three consumed by the nginx image's entrypoint at startup:
+      # HTTP_PORT/HTTPS_PORT -> envsubst into default.conf.template;
+      # NGINX_ENTRYPOINT_LOCAL_RESOLVERS -> makes it export ${NGINX_LOCAL_RESOLVERS}
+      # (the container's DNS servers) for the `resolver` directive in that template.
+      HTTP_PORT: ${HTTP_PORT:-8080}
+      HTTPS_PORT: ${HTTPS_PORT:-8443}
+      NGINX_ENTRYPOINT_LOCAL_RESOLVERS: "1"
+    volumes:
+      - ./infra/nginx/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ./infra/nginx/certs:/etc/nginx/certs:ro
+      - frontend_dist:/usr/share/nginx/html:ro
+    ports:
+      # host port = container port so the http->https redirect can name the right port.
+      # 42 rootless Podman can't bind < 1024, hence the 8080/8443 defaults (see .env).
+      - "${BIND_ADDRESS:-127.0.0.1}:${HTTPS_PORT:-8443}:${HTTPS_PORT:-8443}"
+      - "${BIND_ADDRESS:-127.0.0.1}:${HTTP_PORT:-8080}:${HTTP_PORT:-8080}"
+    depends_on:
+      frontend:
+        condition: service_completed_successfully
+      backend:
+        # nginx resolves "backend" per request (see infra/nginx/default.conf.template),
+        # so it no longer needs the backend up at boot — this just orders startup.
+        condition: service_started
+    networks:
+      - app_net
+
+
+networks:
+  app_net:
+    driver: bridge
+
+volumes:
+  db_data:
+  frontend_dist:
+  uploads_data:

@@ -1,0 +1,172 @@
+# Owner: Track 1 (Foundation, Auth, and API infrastructure)
+# Responsible for: HTTPS termination and reverse proxying all browser-facing traffic to the frontend/backend containers.
+#
+# This is an nginx image *template*: the container's entrypoint runs envsubst on it at
+# startup, replacing ${HTTP_PORT} / ${HTTPS_PORT} (passed from .env via docker-compose.yml)
+# and writing the result to /etc/nginx/conf.d/default.conf. Only ${VAR} tokens that match
+# a real env var are substituted — nginx's own $host, $uri, $scheme… are left untouched.
+
+# The backend is reached through a per-request DNS lookup: proxy_pass uses the
+# $backend_api variable (set below) plus the `resolver` directive, instead of a bare
+# `server backend:3000` that nginx would resolve once at startup — and refuse to boot
+# if the backend container weren't up yet. With this, nginx always starts; requests
+# made before the backend is listening just 502 -> error page, then recover on their
+# own. ${NGINX_LOCAL_RESOLVERS} is filled by the nginx image's own entrypoint from
+# /etc/resolv.conf (enabled via NGINX_ENTRYPOINT_LOCAL_RESOLVERS in docker-compose.yml)
+# and is correct under both Docker and rootless Podman.
+
+# Map the Upgrade header so WebSocket requests get "Connection: upgrade" and plain
+# HTTP polling requests get "Connection: close" (Socket.IO uses both).
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen ${HTTP_PORT};
+    server_name localhost;
+    # 308, not 301: a script that POSTs to the http address is sent to https with its method and body kept
+    return 308 https://$host:${HTTPS_PORT}$request_uri;
+}
+
+server {
+    listen ${HTTPS_PORT} ssl;
+    server_name localhost;
+
+    ssl_certificate     /etc/nginx/certs/server.crt;
+    ssl_certificate_key /etc/nginx/certs/server.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_session_timeout 1d;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_tickets off;
+    server_tokens       off;
+
+    # Security headers for every page nginx serves (the API adds its own through helmet).
+    # `always` also puts them on error pages. Note: a location that sets its own add_header does not inherit these.
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "same-origin" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()" always;
+    # Content-Security-Policy: scripts only from this origin (no inline script: the theme bootstrap is
+    # /theme-init.js), connections only to this origin over https/wss, nothing may frame the app.
+    # 'unsafe-inline' is kept for styles only (Svelte and Excalidraw set inline style attributes).
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://avatars.githubusercontent.com; font-src 'self' data:; connect-src 'self'; worker-src 'self' blob:; frame-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'" always;
+    # No Strict-Transport-Security here on purpose: it would be remembered by the browser for the whole host
+    # "localhost" (every port) with a certificate that is self-signed. Add it in a real deployment:
+    #   add_header Strict-Transport-Security "max-age=31536000" always;
+
+    root /usr/share/nginx/html;
+
+    # See the note at the top of this file. The variable forces per-request resolution;
+    # a bare hostname in proxy_pass would be resolved once at startup and block boot.
+    resolver ${NGINX_LOCAL_RESOLVERS} valid=10s;
+    set $backend_api "http://backend:3000";
+
+    proxy_intercept_errors on;
+    error_page 404 /not-found/index.html;
+    error_page 502 503 504 /error/index.html;
+
+    # API -> Node.js backend. `^~` so that the static-assets rule below (a regex, which would win over a plain prefix)
+    # cannot capture API URLs that end in an image extension, like the uploaded avatars at /api/avatars/<id>.png
+    location ^~ /api/ {
+        client_max_body_size 11M;
+        proxy_pass         $backend_api;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        # Overwrite, never append: nginx is the only proxy, so the client address is $remote_addr and whatever the
+        # client sent in this header must not be believed (the backend uses it for per-client rate limits).
+        proxy_set_header   X-Forwarded-For   $remote_addr;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+    }
+
+    # The documentation of the public API is a page of the site (same header and colours), fed by /api/openapi.json.
+    # /api/docs stays the address people know: it leads there.
+    location = /api/docs {
+        return 302 /api-docs;
+    }
+
+    # Socket.IO -> backend with WebSocket upgrade
+    location ^~ /socket.io/ {
+        proxy_pass         $backend_api;
+        proxy_http_version 1.1;
+        proxy_set_header   Upgrade           $http_upgrade;
+        proxy_set_header   Connection        $connection_upgrade;
+        proxy_set_header   Host              $host;
+        proxy_set_header   X-Real-IP         $remote_addr;
+        proxy_set_header   X-Forwarded-For   $remote_addr;
+        proxy_set_header   X-Forwarded-Proto $scheme;
+    }
+
+    # /invite/:token -> invitation acceptance
+    location ~ ^/invite/[^/]+$ {
+        try_files /invite/index.html =404;
+    }
+
+    # /auth/callback -> OAuth redirect handler
+    location = /auth/callback {
+        try_files /auth-callback/index.html =404;
+    }
+
+    # /forgot-password
+    location = /forgot-password {
+        try_files /forgot-password/index.html =404;
+    }
+
+    # /app exactly -> project list (dashboard)
+    location = /app {
+        try_files /dashboard/index.html =404;
+    }
+
+    # /app/:id/settings
+    location ~ ^/app/[^/]+/settings$ {
+        try_files /project-settings/index.html =404;
+    }
+
+    # /app/:id/whiteboard
+    location ~ ^/app/[^/]+/whiteboard$ {
+        try_files /whiteboard/index.html =404;
+    }
+
+    # /app/:id/notes and /app/:id/notes/:noteId
+    location ~ ^/app/[^/]+/notes(/[^/]+)?$ {
+        try_files /notes/index.html =404;
+    }
+    # /app/:id/files
+    location ~ ^/app/[^/]+/files$ {
+        try_files /files/index.html =404;
+    }
+    # /app/:id/search
+    location ~ ^/app/[^/]+/search$ {
+        try_files /search/index.html =404;
+    }
+
+    # /app/:id -> kanban
+    location ~ ^/app/[^/]+$ {
+        try_files /kanban/index.html =404;
+    }
+
+    # The theme bootstrap is small and may change: revalidate it, unlike the hashed assets below
+    location = /theme-init.js {
+        expires -1;
+    }
+
+    # Static assets (JS, CSS, images, fonts)
+    location ~* \.(js|css|png|jpg|jpeg|gif|svg|ico|woff2?)$ {
+        expires 1y;
+    }
+
+    # /settings -> user settings
+    location = /settings {
+        try_files /settings/index.html =404;
+    }
+
+    # / -> landing page
+    location = / {
+        try_files /landing/index.html =404;
+    }
+
+    # Static assets and remaining routes (login, signup, legal…)
+    location / {
+        try_files $uri $uri/index.html =404;
+    }
+}
